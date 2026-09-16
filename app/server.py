@@ -10,8 +10,19 @@ import base64
 
 from config import DEFAULT_CONFIGS
 from handle_text import prepare_tts_input_with_context
-from tts_handler import generate_speech, generate_speech_stream, get_models_formatted, get_voices, get_voices_formatted
-from utils import getenv_bool, require_api_key, AUDIO_FORMAT_MIME_TYPES, DETAILED_ERROR_LOGGING
+from tts_handler import (
+    AudioFormatError,
+    AudioFormatUnavailableError,
+    VoiceValidationError,
+    generate_speech,
+    generate_speech_stream,
+    get_models_formatted,
+    get_voices,
+    get_voices_formatted,
+    model_data,
+    validate_voice,
+)
+from utils import api_error, getenv_bool, require_api_key, AUDIO_FORMAT_MIME_TYPES, DETAILED_ERROR_LOGGING
 
 app = Flask(__name__)
 load_dotenv()
@@ -26,45 +37,30 @@ DEFAULT_SPEED = float(os.getenv('DEFAULT_SPEED', str(DEFAULT_CONFIGS["DEFAULT_SP
 REMOVE_FILTER = getenv_bool('REMOVE_FILTER', DEFAULT_CONFIGS["REMOVE_FILTER"])
 EXPAND_API = getenv_bool('EXPAND_API', DEFAULT_CONFIGS["EXPAND_API"])
 
-# DEFAULT_MODEL = os.getenv('DEFAULT_MODEL', 'tts-1')
+DEFAULT_MODEL = os.getenv('DEFAULT_MODEL', DEFAULT_CONFIGS['DEFAULT_MODEL'])
+AUDIO_SAMPLE_RATE = os.getenv('AUDIO_SAMPLE_RATE', str(DEFAULT_CONFIGS['AUDIO_SAMPLE_RATE']))
+AUDIO_CHANNELS = os.getenv('AUDIO_CHANNELS', str(DEFAULT_CONFIGS['AUDIO_CHANNELS']))
 
-# Currently in "beta" — needs more extensive testing where drop-in replacement warranted
 def generate_sse_audio_stream(text, voice, speed):
-    """Generator function for SSE streaming with JSON events."""
+    """Generate OpenAI-compatible SSE events for MP3 audio chunks."""
     try:
-        # Generate streaming audio chunks and convert to SSE format
         for chunk in generate_speech_stream(text, voice, speed):
-            # Base64 encode the audio chunk
             encoded_audio = base64.b64encode(chunk).decode('utf-8')
-            
-            # Create SSE event for audio delta
-            event_data = {
-                "type": "speech.audio.delta",
-                "audio": encoded_audio
-            }
-            
-            # Format as SSE event
-            yield f"data: {json.dumps(event_data)}\n\n"
-        
-        # Send completion event
-        completion_event = {
-            "type": "speech.audio.done",
-            "usage": {
-                "input_tokens": len(text.split()),  # Rough estimate
-                "output_tokens": 0,  # Edge TTS doesn't provide this
-                "total_tokens": len(text.split())
-            }
-        }
-        yield f"data: {json.dumps(completion_event)}\n\n"
-        
+
+            yield f"data: {json.dumps({'audio': encoded_audio})}\n\n"
+
+        yield "data: [DONE]\n\n"
     except Exception as e:
-        print(f"Error during SSE streaming: {e}")
-        # Send error event
+        app.logger.error("Error during SSE streaming: %s", e)
         error_event = {
-            "type": "error",
-            "error": str(e)
+            "error": {
+                "message": str(e),
+                "type": "server_error",
+                "code": "speech_generation_failed",
+            }
         }
         yield f"data: {json.dumps(error_event)}\n\n"
+        yield "data: [DONE]\n\n"
 
 # OpenAI endpoint format
 @app.route('/v1/audio/speech', methods=['POST'])
@@ -72,71 +68,129 @@ def generate_sse_audio_stream(text, voice, speed):
 @require_api_key
 def text_to_speech():
     try:
-        data = request.json
-        if not data or 'input' not in data:
-            return jsonify({"error": "Missing 'input' in request body"}), 400
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return api_error("Request body must be a JSON object.", "invalid_json")
+        if 'input' not in data:
+            return api_error("Missing 'input' in request body.", "missing_input")
 
         text = data.get('input')
+        if not isinstance(text, str) or not text.strip():
+            return api_error("'input' must be a non-empty string.", "invalid_input")
 
         if not REMOVE_FILTER:
             text = prepare_tts_input_with_context(text)
 
-        # model = data.get('model', DEFAULT_MODEL)
+        model = data.get('model', DEFAULT_MODEL)
+        if not isinstance(model, str) or not model:
+            return api_error("'model' must be a non-empty string.", "invalid_model")
+        supported_models = {item['id'] for item in model_data}
+        if model not in supported_models:
+            return api_error(f"Unsupported model '{model}'.", "unsupported_model")
+
         voice = data.get('voice', DEFAULT_VOICE)
+        if not isinstance(voice, str) or not voice:
+            return api_error("'voice' must be a non-empty string.", "invalid_voice")
+
         response_format = data.get('response_format', DEFAULT_RESPONSE_FORMAT)
-        speed = float(data.get('speed', DEFAULT_SPEED))
-        
-        # Check stream format - only "sse" triggers streaming
-        stream_format = data.get('stream_format', 'audio')  # 'audio' (default) or 'sse'
-        
-        mime_type = AUDIO_FORMAT_MIME_TYPES.get(response_format, "audio/mpeg")
-        
+        if not isinstance(response_format, str) or not response_format:
+            return api_error(
+                "'response_format' must be a non-empty string.",
+                "invalid_response_format",
+            )
+        if response_format not in AUDIO_FORMAT_MIME_TYPES:
+            return api_error(
+                f"Unsupported response_format '{response_format}'.",
+                "unsupported_response_format",
+            )
+
+        try:
+            speed = float(data.get('speed', DEFAULT_SPEED))
+        except (TypeError, ValueError):
+            return api_error("'speed' must be a number between 0 and 2.", "invalid_speed")
+        if not 0 <= speed <= 2:
+            return api_error("'speed' must be between 0 and 2.", "invalid_speed")
+
+        stream_format = data.get('stream_format', 'audio')
+        if not isinstance(stream_format, str) or not stream_format:
+            return api_error(
+                "'stream_format' must be a non-empty string.",
+                "invalid_stream_format",
+            )
+        if stream_format not in {'audio', 'sse'}:
+            return api_error(
+                f"Unsupported stream_format '{stream_format}'.",
+                "unsupported_stream_format",
+            )
+        if stream_format == 'sse' and response_format != 'mp3':
+            return api_error(
+                "stream_format=sse currently supports response_format=mp3 only.",
+                "unsupported_response_format",
+            )
+
+        try:
+            validate_voice(voice)
+        except VoiceValidationError as exc:
+            return api_error(str(exc), "unsupported_voice")
+
+        mime_type = AUDIO_FORMAT_MIME_TYPES[response_format]
+
         if stream_format == 'sse':
-            # Return SSE streaming response with JSON events
             def generate_sse():
                 for event in generate_sse_audio_stream(text, voice, speed):
                     yield event
-            
+
             return Response(
                 generate_sse(),
                 mimetype='text/event-stream',
                 headers={
-                    'Content-Type': 'text/event-stream',
                     'Cache-Control': 'no-cache',
                     'Connection': 'keep-alive',
-                    'X-Accel-Buffering': 'no'  # Disable nginx buffering
+                    'X-Accel-Buffering': 'no',
+                    'X-Audio-Sample-Rate': AUDIO_SAMPLE_RATE,
+                    'X-Audio-Channels': AUDIO_CHANNELS,
                 }
             )
         else:
-            # Return raw audio data (like OpenAI) - can be piped to ffplay
-            output_file_path = generate_speech(text, voice, response_format, speed)
-            
-            # Read the file and return raw audio data
-            with open(output_file_path, 'rb') as audio_file:
-                audio_data = audio_file.read()
-            
-            # Clean up the temporary file
             try:
-                os.unlink(output_file_path)
-            except OSError:
-                pass  # File might already be cleaned up
-            
+                output_file_path = generate_speech(text, voice, response_format, speed)
+                with open(output_file_path, 'rb') as audio_file:
+                    audio_data = audio_file.read()
+            except (AudioFormatError, AudioFormatUnavailableError) as exc:
+                return api_error(str(exc), "unsupported_response_format")
+            finally:
+                if 'output_file_path' in locals():
+                    try:
+                        os.unlink(output_file_path)
+                    except OSError:
+                        pass
+
             return Response(
                 audio_data,
                 mimetype=mime_type,
                 headers={
                     'Content-Type': mime_type,
-                    'Content-Length': str(len(audio_data))
+                    'Content-Length': str(len(audio_data)),
+                    'X-Audio-Sample-Rate': AUDIO_SAMPLE_RATE,
+                    'X-Audio-Channels': AUDIO_CHANNELS,
                 }
             )
-            
+
+    except (AudioFormatError, AudioFormatUnavailableError) as exc:
+        return api_error(str(exc), "unsupported_response_format")
+    except VoiceValidationError as exc:
+        return api_error(str(exc), "unsupported_voice")
     except Exception as e:
         if DETAILED_ERROR_LOGGING:
             app.logger.error(f"Error in text_to_speech: {str(e)}\n{traceback.format_exc()}")
         else:
             app.logger.error(f"Error in text_to_speech: {str(e)}")
-        # Return a 500 error for unhandled exceptions, which is more standard than 400
-        return jsonify({"error": "An internal server error occurred", "details": str(e)}), 500
+        return api_error(
+            "An internal server error occurred.",
+            "internal_server_error",
+            500,
+            "server_error",
+        )
 
 # OpenAI endpoint format
 @app.route('/v1/models', methods=['GET', 'POST'])

@@ -19,17 +19,36 @@ API_KEY = os.getenv('API_KEY', DEFAULT_CONFIGS["API_KEY"])
 REQUIRE_API_KEY = getenv_bool('REQUIRE_API_KEY', DEFAULT_CONFIGS["REQUIRE_API_KEY"])
 DETAILED_ERROR_LOGGING = getenv_bool('DETAILED_ERROR_LOGGING', DEFAULT_CONFIGS["DETAILED_ERROR_LOGGING"])
 
+
+def api_error(message: str, code: str, status_code: int = 400, error_type: str = "invalid_request_error"):
+    return jsonify({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": code,
+        }
+    }), status_code
+
 def require_api_key(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not REQUIRE_API_KEY:
             return f(*args, **kwargs)
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({"error": "Missing or invalid API key"}), 401
-        token = auth_header.split('Bearer ')[1]
-        if token != API_KEY:
-            return jsonify({"error": "Invalid API key"}), 401
+        candidate_tokens = []
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header:
+            scheme, separator, token = auth_header.partition(' ')
+            if separator and scheme.lower() == 'bearer' and token:
+                candidate_tokens.append(token)
+
+        api_key_header = request.headers.get('api-key')
+        if api_key_header:
+            candidate_tokens.append(api_key_header)
+
+        if not candidate_tokens:
+            return api_error("Missing API key", "missing_api_key", 401, "authentication_error")
+        if API_KEY not in candidate_tokens:
+            return api_error("Invalid API key", "invalid_api_key", 401, "authentication_error")
         return f(*args, **kwargs)
     return decorated_function
 

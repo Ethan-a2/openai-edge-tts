@@ -19,10 +19,10 @@ This project provides a local, OpenAI-compatible text-to-speech (TTS) API using 
 ## Features
 
 - **OpenAI-Compatible Endpoint**: `/v1/audio/speech` with similar request structure and behavior.
-- **SSE Streaming Support**: Real-time audio streaming via Server-Sent Events when `stream_format: "sse"` is specified.
+- **Opt-in SSE Streaming**: Real-time MP3 streaming via Server-Sent Events only when `stream_format: "sse"` is specified; normal requests still return MP3 bytes.
 - **Supported Voices**: Maps OpenAI voices (alloy, echo, fable, onyx, nova, shimmer) to `edge-tts` equivalents.
 - **Flexible Formats**: Supports multiple audio formats (mp3, opus, aac, flac, wav, pcm).
-- **Adjustable Speed**: Option to modify playback speed (0.25x to 4.0x).
+- **Adjustable Speed**: Option to modify playback speed from 0x to 2x.
 - **Optional Direct Edge-TTS Voice Selection**: Use either OpenAI voice mappings or specify [any edge-tts voice](https://tts.travisvn.com) directly.
 
 ## ⚡️ Quick start
@@ -42,8 +42,8 @@ _(Docker required, obviously)_
 ### Prerequisites
 
 - **Docker** (recommended): Docker and Docker Compose for containerized setup.
-- **Python** (optional): For local development, install dependencies in `requirements.txt`.
-- **ffmpeg** (optional): Required for audio format conversion. Optional if sticking to mp3.
+- **Python 3.10+** (optional): For running the service without Docker.
+- **ffmpeg** (optional): Required for `wav`, `pcm`, `opus`, `aac`, and `flac`; MP3 does not require it.
 
 ### Installation
 
@@ -59,10 +59,13 @@ cd openai-edge-tts
 ```
 API_KEY=your_api_key_here
 PORT=5050
+DEFAULT_MODEL=tts-1
 
 DEFAULT_VOICE=en-US-AvaNeural
 DEFAULT_RESPONSE_FORMAT=mp3
 DEFAULT_SPEED=1.0
+AUDIO_SAMPLE_RATE=24000
+AUDIO_CHANNELS=1
 
 DEFAULT_LANGUAGE=en-US
 
@@ -171,6 +174,15 @@ venv\Scripts\activate
 
 ### 3. Install Dependencies
 
+On Debian/Ubuntu, install the optional converter if you need formats other than MP3:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3-venv ffmpeg
+```
+
+If you only need MP3, `ffmpeg` can be omitted.
+
 Use `pip` to install the required packages listed in `requirements.txt`:
 
 ```bash
@@ -184,10 +196,13 @@ Create a `.env` file in the root directory and set the following variables:
 ```plaintext
 API_KEY=your_api_key_here
 PORT=5050
+DEFAULT_MODEL=tts-1
 
 DEFAULT_VOICE=en-US-AvaNeural
 DEFAULT_RESPONSE_FORMAT=mp3
 DEFAULT_SPEED=1.0
+AUDIO_SAMPLE_RATE=24000
+AUDIO_CHANNELS=1
 
 DEFAULT_LANGUAGE=en-US
 
@@ -206,6 +221,39 @@ python app/server.py
 ```
 
 The server will start running at `http://localhost:5050`.
+
+The service uses the built-in gevent WSGI server, so this command does not require Docker or a separate application server:
+
+```bash
+./venv/bin/python app/server.py
+```
+
+For a persistent Linux service, create `/etc/systemd/system/openai-edge-tts.service`:
+
+```ini
+[Unit]
+Description=OpenAI-compatible Edge TTS API
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/media/code/tools/openai-edge-tts
+EnvironmentFile=/media/code/tools/openai-edge-tts/.env
+ExecStart=/media/code/tools/openai-edge-tts/venv/bin/python app/server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then enable it with:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now openai-edge-tts
+sudo systemctl status openai-edge-tts
+```
 
 ### 6. Test the API
 
@@ -230,11 +278,11 @@ Generates audio from the input text. Available parameters:
 
 **Optional Parameters:**
 
-- **model** (string): Set to "tts-1" or "tts-1-hd" (default: `"tts-1"`).
+- **model** (string): Set to `tts-1`, `tts-1-hd`, or `gpt-4o-mini-tts` (default: `"tts-1"`).
 - **voice** (string): One of the OpenAI-compatible voices (alloy, echo, fable, onyx, nova, shimmer) or any valid `edge-tts` voice (default: `"en-US-AvaNeural"`).
 - **response_format** (string): Audio format. Options: `mp3`, `opus`, `aac`, `flac`, `wav`, `pcm` (default: `mp3`).
-- **speed** (number): Playback speed (0.25 to 4.0). Default is `1.0`.
-- **stream_format** (string): Response format. Options: `"audio"` (raw audio data, default) or `"sse"` (Server-Sent Events streaming with JSON events).
+- **speed** (number): Playback speed (0 to 2). Default is `1.0`.
+- **stream_format** (string): Options: `"audio"` (raw audio data, default) or `"sse"` (Server-Sent Events streaming). SSE currently supports MP3 only.
 
 **Note:** The API is fully compatible with OpenAI's TTS API specification. The `instructions` parameter (for fine-tuning voice characteristics) is not currently supported, but all other parameters work identically to OpenAI's implementation.
 
@@ -316,11 +364,11 @@ curl -X POST http://localhost:5050/v1/audio/speech \
 **SSE Response Format:**
 
 ```
-data: {"type": "speech.audio.delta", "audio": "base64-encoded-audio-chunk"}
+data: {"audio": "base64-encoded-audio-chunk"}
 
-data: {"type": "speech.audio.delta", "audio": "base64-encoded-audio-chunk"}
+data: {"audio": "base64-encoded-audio-chunk"}
 
-data: {"type": "speech.audio.done", "usage": {"input_tokens": 12, "output_tokens": 0, "total_tokens": 12}}
+data: [DONE]
 ```
 
 #### JavaScript/Web Usage
@@ -355,9 +403,11 @@ async function streamTTSWithSSE(text) {
 
     for (const line of lines) {
       if (line.startsWith('data: ')) {
-        const data = JSON.parse(line.slice(6));
+        const data = line.slice(6) === '[DONE]'
+          ? { done: true }
+          : JSON.parse(line.slice(6));
 
-        if (data.type === 'speech.audio.delta') {
+        if (data.audio) {
           // Decode base64 audio chunk
           const audioData = atob(data.audio);
           const audioArray = new Uint8Array(audioData.length);
@@ -365,7 +415,7 @@ async function streamTTSWithSSE(text) {
             audioArray[i] = audioData.charCodeAt(i);
           }
           audioChunks.push(audioArray);
-        } else if (data.type === 'speech.audio.done') {
+        } else if (data.done) {
           console.log('Speech synthesis complete:', data.usage);
 
           // Combine all chunks and play
@@ -443,9 +493,11 @@ async function streamTTSWithSSE(text) {
 
     for (const line of lines) {
       if (line.startsWith('data: ')) {
-        const data = JSON.parse(line.slice(6));
+        const data = line.slice(6) === '[DONE]'
+          ? { done: true }
+          : JSON.parse(line.slice(6));
 
-        if (data.type === 'speech.audio.delta') {
+        if (data.audio) {
           // Decode base64 audio chunk
           const audioData = atob(data.audio);
           const audioArray = new Uint8Array(audioData.length);
@@ -453,7 +505,7 @@ async function streamTTSWithSSE(text) {
             audioArray[i] = audioData.charCodeAt(i);
           }
           audioChunks.push(audioArray);
-        } else if (data.type === 'speech.audio.done') {
+        } else if (data.done) {
           console.log('Speech synthesis complete:', data.usage);
 
           // Combine all chunks and play

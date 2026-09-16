@@ -6,9 +6,12 @@ DEFAULT_CONFIGS = {
     "API_KEY": 'your_api_key_here',  # Fallback API key
 
     # TTS settings
+    "DEFAULT_MODEL": 'tts-1',
     "DEFAULT_VOICE": 'en-US-AvaNeural',
     "DEFAULT_RESPONSE_FORMAT": 'mp3',
     "DEFAULT_SPEED": 1.0,
+    "AUDIO_SAMPLE_RATE": 24000,
+    "AUDIO_CHANNELS": 1,
     "DEFAULT_LANGUAGE": 'en-US',
 
     # Feature flags
@@ -16,4 +19,4 @@ DEFAULT_CONFIGS = {
     "REMOVE_FILTER": False,
     "EXPAND_API": True,
     "DETAILED_ERROR_LOGGING": True,
-} 
+}

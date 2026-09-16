@@ -6,9 +6,22 @@ import tempfile
 import subprocess
 import os
 from pathlib import Path
+from functools import lru_cache
 
 from utils import DETAILED_ERROR_LOGGING
 from config import DEFAULT_CONFIGS
+
+
+class AudioFormatError(ValueError):
+    pass
+
+
+class AudioFormatUnavailableError(AudioFormatError):
+    pass
+
+
+class VoiceValidationError(ValueError):
+    pass
 
 # Language default (environment variable)
 DEFAULT_LANGUAGE = os.getenv('DEFAULT_LANGUAGE', DEFAULT_CONFIGS["DEFAULT_LANGUAGE"])
@@ -34,6 +47,8 @@ model_data = [
         {"id": "gpt-4o-mini-tts", "name": "GPT-4o mini TTS"}
     ]
 
+SUPPORTED_RESPONSE_FORMATS = frozenset({"mp3", "opus", "aac", "flac", "wav", "pcm"})
+
 def is_ffmpeg_installed():
     """Check if FFmpeg is installed and accessible."""
     try:
@@ -57,17 +72,53 @@ async def _generate_audio_stream(text, voice, speed):
     # Create the communicator for streaming
     communicator = edge_tts.Communicate(text=text, voice=edge_tts_voice, rate=speed_rate)
     
-    # Stream the audio data
-    async for chunk in communicator.stream():
-        if chunk["type"] == "audio":
-            yield chunk["data"]
+    stream_iterator = communicator.stream()
+    try:
+        async for chunk in stream_iterator:
+            if chunk["type"] == "audio":
+                yield chunk["data"]
+    finally:
+        await stream_iterator.aclose()
 
 def generate_speech_stream(text, voice, speed=1.0):
-    """Generate streaming speech audio (synchronous wrapper)."""
-    return asyncio.run(_generate_audio_stream(text, voice, speed))
+    event_loop = asyncio.new_event_loop()
+    async_iterator = _generate_audio_stream(text, voice, speed).__aiter__()
+
+    try:
+        while True:
+            try:
+                yield event_loop.run_until_complete(async_iterator.__anext__())
+            except StopAsyncIteration:
+                break
+    finally:
+        close_method = getattr(async_iterator, "aclose", None)
+        if close_method is not None:
+            try:
+                event_loop.run_until_complete(close_method())
+            except Exception:
+                pass
+        try:
+            event_loop.run_until_complete(event_loop.shutdown_asyncgens())
+            pending_tasks = [
+                task for task in asyncio.all_tasks(event_loop)
+                if not task.done()
+            ]
+            if pending_tasks:
+                event_loop.run_until_complete(
+                    asyncio.gather(*pending_tasks, return_exceptions=True)
+                )
+        except Exception:
+            pass
+        event_loop.close()
 
 async def _generate_audio(text, voice, response_format, speed):
     """Generate TTS audio and optionally convert to a different format."""
+    if response_format not in SUPPORTED_RESPONSE_FORMATS:
+        supported_formats = ", ".join(sorted(SUPPORTED_RESPONSE_FORMATS))
+        raise AudioFormatError(
+            f"Unsupported response_format '{response_format}'. Supported formats: {supported_formats}."
+        )
+
     # Determine if the voice is an OpenAI-compatible voice or a direct edge-tts voice
     edge_tts_voice = voice_mapping.get(voice, voice)  # Use mapping if in OpenAI names, otherwise use as-is
 
@@ -93,8 +144,10 @@ async def _generate_audio(text, voice, response_format, speed):
 
     # Check if FFmpeg is installed
     if not is_ffmpeg_installed():
-        print("FFmpeg is not available. Returning unmodified mp3 file.")
-        return temp_mp3_path # Return the original mp3 path, it won't be cleaned by this function
+        Path(temp_mp3_path).unlink(missing_ok=True)
+        raise AudioFormatUnavailableError(
+            f"response_format={response_format} requires ffmpeg, which is not installed."
+        )
 
     # Create a new temporary file for the converted output
     converted_file_obj = tempfile.NamedTemporaryFile(delete=False, suffix=f".{response_format}")
@@ -102,32 +155,36 @@ async def _generate_audio(text, voice, response_format, speed):
     converted_file_obj.close() # Close file object, ffmpeg will write to the path
 
     # Build the FFmpeg command
-    ffmpeg_command = [
-        "ffmpeg",
-        "-i", temp_mp3_path,  # Input file path
-        "-c:a", {
-            "aac": "aac",
-            "mp3": "libmp3lame",
-            "wav": "pcm_s16le",
-            "opus": "libopus",
-            "flac": "flac"
-        }.get(response_format, "aac"),  # Default to AAC if unknown
-    ]
+    ffmpeg_command = ["ffmpeg", "-i", temp_mp3_path]
+    if response_format == "pcm":
+        ffmpeg_command.extend([
+            "-ar", "24000",
+            "-ac", "1",
+            "-c:a", "pcm_s16le",
+            "-f", "s16le",
+        ])
+    else:
+        ffmpeg_command.extend([
+            "-ar", "24000",
+            "-ac", "1",
+            "-c:a", {
+                "aac": "aac",
+                "opus": "libopus",
+                "flac": "flac",
+                "wav": "pcm_s16le",
+            }[response_format],
+            "-f", {
+                "aac": "adts",
+                "opus": "ogg",
+                "flac": "flac",
+                "wav": "wav",
+            }[response_format],
+        ])
 
-    if response_format != "wav":
+    if response_format not in {"wav", "pcm", "flac"}:
         ffmpeg_command.extend(["-b:a", "192k"])
 
-    ffmpeg_command.extend([
-        "-f", {
-            "aac": "mp4",  # AAC in MP4 container
-            "mp3": "mp3",
-            "wav": "wav",
-            "opus": "ogg",
-            "flac": "flac"
-        }.get(response_format, response_format),  # Default to matching format
-        "-y",  # Overwrite without prompt
-        converted_path  # Output file path
-    ])
+    ffmpeg_command.extend(["-y", converted_path])
 
     try:
         # Run FFmpeg command and ensure no errors occur
@@ -153,6 +210,29 @@ async def _generate_audio(text, voice, response_format, speed):
 
 def generate_speech(text, voice, response_format, speed=1.0):
     return asyncio.run(_generate_audio(text, voice, response_format, speed))
+
+
+async def _list_voice_names():
+    voices = await edge_tts.list_voices()
+    return frozenset(voice["ShortName"] for voice in voices)
+
+
+@lru_cache(maxsize=1)
+def get_available_voice_names():
+    return asyncio.run(_list_voice_names())
+
+
+def validate_voice(voice):
+    if voice in voice_mapping:
+        return
+
+    try:
+        available_voice_names = get_available_voice_names()
+    except Exception as exc:
+        raise VoiceValidationError("Unable to load the Edge TTS voice catalog.") from exc
+
+    if voice not in available_voice_names:
+        raise VoiceValidationError(f"Unsupported voice '{voice}'.")
 
 def get_models():
     return model_data
