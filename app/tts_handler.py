@@ -39,12 +39,15 @@ voice_mapping = {
     'sage': 'en-US-JennyNeural',
     'shimmer': 'en-US-EmmaNeural',
     'verse': 'en-US-BrianNeural',
+    'marin': 'en-US-AvaNeural',
+    'cedar': 'en-US-GuyNeural',
 }
 
 model_data = [
         {"id": "tts-1", "name": "Text-to-speech v1"},
         {"id": "tts-1-hd", "name": "Text-to-speech v1 HD"},
-        {"id": "gpt-4o-mini-tts", "name": "GPT-4o mini TTS"}
+        {"id": "gpt-4o-mini-tts", "name": "GPT-4o mini TTS"},
+        {"id": "gpt-4o-mini-tts-2025-12-15", "name": "GPT-4o mini TTS (2025-12-15)"}
     ]
 
 SUPPORTED_RESPONSE_FORMATS = frozenset({"mp3", "opus", "aac", "flac", "wav", "pcm"})
@@ -52,10 +55,24 @@ SUPPORTED_RESPONSE_FORMATS = frozenset({"mp3", "opus", "aac", "flac", "wav", "pc
 def is_ffmpeg_installed():
     """Check if FFmpeg is installed and accessible."""
     try:
-        subprocess.run(['ffmpeg', '-version'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        ffmpeg_executable()
         return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (RuntimeError, FileNotFoundError, subprocess.CalledProcessError):
         return False
+
+
+def ffmpeg_executable():
+    """Return the host ffmpeg executable used for non-MP3 formats."""
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-version'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        if result.returncode == 0:
+            return 'ffmpeg'
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    raise RuntimeError("ffmpeg is not installed")
 
 async def _generate_audio_stream(text, voice, speed):
     """Generate streaming TTS audio using edge-tts."""
@@ -133,10 +150,15 @@ async def _generate_audio(text, voice, response_format, speed):
         print(f"Error converting speed: {e}. Defaulting to +0%.")
         speed_rate = "+0%"
 
-    # Generate the MP3 file
+    # Generate the MP3 file. Close and remove the placeholder if Edge TTS fails.
     communicator = edge_tts.Communicate(text=text, voice=edge_tts_voice, rate=speed_rate)
-    await communicator.save(temp_mp3_path)
-    temp_mp3_file_obj.close() # Explicitly close our file object for the initial mp3
+    try:
+        await communicator.save(temp_mp3_path)
+    except Exception:
+        Path(temp_mp3_path).unlink(missing_ok=True)
+        raise
+    finally:
+        temp_mp3_file_obj.close()
 
     # If the requested format is mp3, return the generated file directly
     if response_format == "mp3":
@@ -155,7 +177,7 @@ async def _generate_audio(text, voice, response_format, speed):
     converted_file_obj.close() # Close file object, ffmpeg will write to the path
 
     # Build the FFmpeg command
-    ffmpeg_command = ["ffmpeg", "-i", temp_mp3_path]
+    ffmpeg_command = [ffmpeg_executable(), "-i", temp_mp3_path]
     if response_format == "pcm":
         ffmpeg_command.extend([
             "-ar", "24000",
@@ -266,8 +288,8 @@ def speed_to_rate(speed: float) -> str:
     Returns:
         str: The formatted "rate" string (e.g., "+50%" or "-50%").
     """
-    if speed < 0 or speed > 2:
-        raise ValueError("Speed must be between 0 and 2 (inclusive).")
+    if speed < 0.25 or speed > 4:
+        raise ValueError("Speed must be between 0.25 and 4 (inclusive).")
 
     # Convert speed to percentage change
     percentage_change = (speed - 1) * 100

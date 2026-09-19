@@ -55,9 +55,9 @@ def require_api_key(f):
 # Mapping of audio format to MIME type
 AUDIO_FORMAT_MIME_TYPES = {
     "mp3": "audio/mpeg",
-    "opus": "audio/ogg",
+    "opus": "audio/opus",
     "aac": "audio/aac",
     "flac": "audio/flac",
     "wav": "audio/wav",
-    "pcm": "audio/L16"
+    "pcm": "audio/pcm"
 }

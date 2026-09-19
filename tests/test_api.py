@@ -51,6 +51,72 @@ class SpeechApiTestCase(unittest.TestCase):
         self.assertEqual(response.content_type, "audio/mpeg")
         self.assertEqual(response.data, b"\xff\xf3test")
 
+    def test_wav_response_returns_wav_bytes_and_mime_type(self):
+        wav_data = b"RIFF\x24\x00\x00\x00WAVEfmt "
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as audio_file:
+            audio_file.write(wav_data)
+            audio_path = audio_file.name
+
+        try:
+            with patch.object(server, "validate_voice"), patch.object(
+                server, "generate_speech", return_value=audio_path
+            ):
+                response = self.client.post(
+                    "/v1/audio/speech",
+                    json=self._request_payload(response_format="wav"),
+                )
+        finally:
+            Path(audio_path).unlink(missing_ok=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content_type, "audio/wav")
+        self.assertEqual(response.data, wav_data)
+
+    def test_latest_model_and_voice_names_are_accepted(self):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as audio_file:
+            audio_file.write(b"audio")
+            audio_path = audio_file.name
+
+        try:
+            with patch.object(server, "validate_voice"), patch.object(
+                server, "generate_speech", return_value=audio_path
+            ):
+                response = self.client.post(
+                    "/v1/audio/speech",
+                    json=self._request_payload(
+                        model="gpt-4o-mini-tts-2025-12-15",
+                        voice="marin",
+                        instructions="Speak warmly.",
+                        speed=4,
+                    ),
+                )
+        finally:
+            Path(audio_path).unlink(missing_ok=True)
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_voice_catalog_does_not_require_api_key(self):
+        with patch.object(server, "get_voices", return_value=[{"name": "voice"}]) as get_voices:
+            response = self.client.get("/v1/voices/all")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json, {"voices": [{"name": "voice"}]})
+        get_voices.assert_called_once_with("all")
+
+    def test_voice_catalog_accepts_language_query_filter(self):
+        with patch.object(server, "get_voices", return_value=[]) as get_voices:
+            response = self.client.get("/v1/voices?language=zh-CN")
+
+        self.assertEqual(response.status_code, 200)
+        get_voices.assert_called_once_with("zh-CN")
+
+    def test_models_expose_standard_openai_list_shape(self):
+        response = self.client.get("/v1/models")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["object"], "list")
+        self.assertEqual(response.json["data"], response.json["models"])
+
     def test_sse_returns_audio_events_and_done_marker(self):
         with patch.object(server, "validate_voice"), patch.object(
             server, "generate_speech_stream", return_value=iter([b"a", b"b"])
@@ -75,6 +141,15 @@ class SpeechApiTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json["error"]["code"], "unsupported_stream_format")
+
+    def test_speed_uses_current_openai_range(self):
+        for speed in (0.24, 4.01):
+            response = self.client.post(
+                "/v1/audio/speech",
+                json=self._request_payload(speed=speed),
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json["error"]["code"], "invalid_speed")
 
     def test_unsupported_model_is_rejected(self):
         response = self.client.post(

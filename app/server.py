@@ -1,12 +1,16 @@
 # server.py
 
-from flask import Flask, request, send_file, jsonify, Response
-from gevent.pywsgi import WSGIServer
 from dotenv import load_dotenv
+
+load_dotenv()
+
+from flask import Flask, request, jsonify, Response
+from gevent.pywsgi import WSGIServer
 import os
 import traceback
 import json
 import base64
+import math
 
 from config import DEFAULT_CONFIGS
 from handle_text import prepare_tts_input_with_context
@@ -25,7 +29,6 @@ from tts_handler import (
 from utils import api_error, getenv_bool, require_api_key, AUDIO_FORMAT_MIME_TYPES, DETAILED_ERROR_LOGGING
 
 app = Flask(__name__)
-load_dotenv()
 
 API_KEY = os.getenv('API_KEY', DEFAULT_CONFIGS["API_KEY"])
 PORT = int(os.getenv('PORT', str(DEFAULT_CONFIGS["PORT"])))
@@ -41,10 +44,26 @@ DEFAULT_MODEL = os.getenv('DEFAULT_MODEL', DEFAULT_CONFIGS['DEFAULT_MODEL'])
 AUDIO_SAMPLE_RATE = os.getenv('AUDIO_SAMPLE_RATE', str(DEFAULT_CONFIGS['AUDIO_SAMPLE_RATE']))
 AUDIO_CHANNELS = os.getenv('AUDIO_CHANNELS', str(DEFAULT_CONFIGS['AUDIO_CHANNELS']))
 
-def generate_sse_audio_stream(text, voice, speed):
-    """Generate OpenAI-compatible SSE events for MP3 audio chunks."""
+def generate_sse_audio_stream(text, voice, speed, response_format='mp3'):
+    """Generate OpenAI-compatible SSE events containing base64 audio chunks."""
+    temporary_output = None
     try:
-        for chunk in generate_speech_stream(text, voice, speed):
+        if response_format == 'mp3':
+            chunks = generate_speech_stream(text, voice, speed)
+        else:
+            # Edge TTS streams MP3. Convert first when the caller requests a
+            # different OpenAI response format so SSE never advertises the
+            # wrong codec.
+            temporary_output = generate_speech(text, voice, response_format, speed)
+
+            def read_chunks():
+                with open(temporary_output, 'rb') as audio_file:
+                    while chunk := audio_file.read(64 * 1024):
+                        yield chunk
+
+            chunks = read_chunks()
+
+        for chunk in chunks:
             encoded_audio = base64.b64encode(chunk).decode('utf-8')
 
             yield f"data: {json.dumps({'audio': encoded_audio})}\n\n"
@@ -61,6 +80,34 @@ def generate_sse_audio_stream(text, voice, speed):
         }
         yield f"data: {json.dumps(error_event)}\n\n"
         yield "data: [DONE]\n\n"
+    finally:
+        if temporary_output:
+            try:
+                os.unlink(temporary_output)
+            except OSError:
+                pass
+
+
+def _audio_file_response(path, mime_type, download_name):
+    """Read a generated file into the response and always remove the temp file."""
+    try:
+        with open(path, 'rb') as audio_file:
+            audio_data = audio_file.read()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    return Response(
+        audio_data,
+        mimetype=mime_type,
+        headers={
+            'Content-Type': mime_type,
+            'Content-Length': str(len(audio_data)),
+            'Content-Disposition': f'attachment; filename="{download_name}"',
+        },
+    )
 
 # OpenAI endpoint format
 @app.route('/v1/audio/speech', methods=['POST'])
@@ -77,6 +124,8 @@ def text_to_speech():
         text = data.get('input')
         if not isinstance(text, str) or not text.strip():
             return api_error("'input' must be a non-empty string.", "invalid_input")
+        if len(text) > 4096:
+            return api_error("'input' must be at most 4096 characters.", "invalid_input")
 
         if not REMOVE_FILTER:
             text = prepare_tts_input_with_context(text)
@@ -89,8 +138,19 @@ def text_to_speech():
             return api_error(f"Unsupported model '{model}'.", "unsupported_model")
 
         voice = data.get('voice', DEFAULT_VOICE)
+        if isinstance(voice, dict):
+            if not isinstance(voice.get('id'), str) or not voice['id']:
+                return api_error("'voice.id' must be a non-empty string.", "invalid_voice")
+            return api_error(
+                "Custom voice IDs are not supported by the Edge TTS backend.",
+                "unsupported_voice",
+            )
         if not isinstance(voice, str) or not voice:
             return api_error("'voice' must be a non-empty string.", "invalid_voice")
+
+        instructions = data.get('instructions')
+        if instructions is not None and not isinstance(instructions, str):
+            return api_error("'instructions' must be a string.", "invalid_instructions")
 
         response_format = data.get('response_format', DEFAULT_RESPONSE_FORMAT)
         if not isinstance(response_format, str) or not response_format:
@@ -98,6 +158,7 @@ def text_to_speech():
                 "'response_format' must be a non-empty string.",
                 "invalid_response_format",
             )
+        response_format = response_format.lower()
         if response_format not in AUDIO_FORMAT_MIME_TYPES:
             return api_error(
                 f"Unsupported response_format '{response_format}'.",
@@ -107,9 +168,9 @@ def text_to_speech():
         try:
             speed = float(data.get('speed', DEFAULT_SPEED))
         except (TypeError, ValueError):
-            return api_error("'speed' must be a number between 0 and 2.", "invalid_speed")
-        if not 0 <= speed <= 2:
-            return api_error("'speed' must be between 0 and 2.", "invalid_speed")
+            return api_error("'speed' must be a number between 0.25 and 4.", "invalid_speed")
+        if not math.isfinite(speed) or not 0.25 <= speed <= 4:
+            return api_error("'speed' must be between 0.25 and 4.", "invalid_speed")
 
         stream_format = data.get('stream_format', 'audio')
         if not isinstance(stream_format, str) or not stream_format:
@@ -117,17 +178,12 @@ def text_to_speech():
                 "'stream_format' must be a non-empty string.",
                 "invalid_stream_format",
             )
+        stream_format = stream_format.lower()
         if stream_format not in {'audio', 'sse'}:
             return api_error(
                 f"Unsupported stream_format '{stream_format}'.",
                 "unsupported_stream_format",
             )
-        if stream_format == 'sse' and response_format != 'mp3':
-            return api_error(
-                "stream_format=sse currently supports response_format=mp3 only.",
-                "unsupported_response_format",
-            )
-
         try:
             validate_voice(voice)
         except VoiceValidationError as exc:
@@ -137,7 +193,7 @@ def text_to_speech():
 
         if stream_format == 'sse':
             def generate_sse():
-                for event in generate_sse_audio_stream(text, voice, speed):
+                for event in generate_sse_audio_stream(text, voice, speed, response_format):
                     yield event
 
             return Response(
@@ -198,7 +254,10 @@ def text_to_speech():
 @app.route('/v1/audio/models', methods=['GET', 'POST'])
 @app.route('/audio/models', methods=['GET', 'POST'])
 def list_models():
-    return jsonify({"models": get_models_formatted()})
+    models = get_models_formatted()
+    # Keep the historical `models` alias while exposing the standard OpenAI
+    # list shape consumed by SDKs (`object` + `data`).
+    return jsonify({"object": "list", "data": models, "models": models})
 
 # OpenAI endpoint format
 @app.route('/v1/audio/voices', methods=['GET', 'POST'])
@@ -208,21 +267,26 @@ def list_voices_formatted():
 
 @app.route('/v1/voices', methods=['GET', 'POST'])
 @app.route('/voices', methods=['GET', 'POST'])
-@require_api_key
 def list_voices():
-    specific_language = None
+    try:
+        specific_language = None
+        data = request.args if request.method == 'GET' else request.get_json(silent=True)
+        if hasattr(data, 'get') and ('language' in data or 'locale' in data):
+            specific_language = data.get('language') if 'language' in data else data.get('locale')
 
-    data = request.args if request.method == 'GET' else request.json
-    if data and ('language' in data or 'locale' in data):
-        specific_language = data.get('language') if 'language' in data else data.get('locale')
-
-    return jsonify({"voices": get_voices(specific_language)})
+        return jsonify({"voices": get_voices(specific_language)})
+    except Exception as exc:
+        app.logger.error("Unable to load Edge TTS voice catalog: %s", exc)
+        return api_error("Unable to load the Edge TTS voice catalog.", "voice_catalog_unavailable", 503, "server_error")
 
 @app.route('/v1/voices/all', methods=['GET', 'POST'])
 @app.route('/voices/all', methods=['GET', 'POST'])
-@require_api_key
 def list_all_voices():
-    return jsonify({"voices": get_voices('all')})
+    try:
+        return jsonify({"voices": get_voices('all')})
+    except Exception as exc:
+        app.logger.error("Unable to load Edge TTS voice catalog: %s", exc)
+        return api_error("Unable to load the Edge TTS voice catalog.", "voice_catalog_unavailable", 503, "server_error")
 
 """
 Support for ElevenLabs and Azure AI Speech
@@ -262,8 +326,7 @@ def elevenlabs_tts(voice_id):
     except Exception as e:
         return jsonify({"error": f"TTS generation failed: {str(e)}"}), 500
 
-    # Return the generated audio file
-    return send_file(output_file_path, mimetype="audio/mpeg", as_attachment=True, download_name="speech.mp3")
+    return _audio_file_response(output_file_path, "audio/mpeg", "speech.mp3")
 
 # tts.speech.microsoft.com/cognitiveservices/v1
 # https://{region}.tts.speech.microsoft.com/cognitiveservices/v1
@@ -301,8 +364,7 @@ def azure_tts():
     except Exception as e:
         return jsonify({"error": f"TTS generation failed: {str(e)}"}), 500
 
-    # Return the generated audio file
-    return send_file(output_file_path, mimetype="audio/mpeg", as_attachment=True, download_name="speech.mp3")
+    return _audio_file_response(output_file_path, "audio/mpeg", "speech.mp3")
 
 print(f" Edge TTS (Free Azure TTS) Replacement for OpenAI's TTS API")
 print(f" ")

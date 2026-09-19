@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenAI-compatible Edge TTS API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bay
+Group=bay
+WorkingDirectory=/media/code/tools/openai-edge-tts
+EnvironmentFile=-/media/code/tools/openai-edge-tts/.env
+Environment=PORT=5051
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/env PORT=5051 /media/code/tools/openai-edge-tts/.venv/bin/python -u /media/code/tools/openai-edge-tts/app/server.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

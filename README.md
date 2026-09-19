@@ -12,6 +12,26 @@ This project provides a local, OpenAI-compatible text-to-speech (TTS) API using 
 
 `edge-tts` uses Microsoft Edge's online text-to-speech service, so it is completely free.
 
+## Run with uv and systemd (Linux)
+
+The repository includes a user-level systemd unit at
+`deploy/openai-edge-tts.service`. It runs the API directly on the host at port
+`5051` and uses the host's `ffmpeg` for WAV/PCM/Opus/AAC/FLAC conversion.
+
+```bash
+uv venv .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+mkdir -p ~/.config/systemd/user
+cp deploy/openai-edge-tts.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now openai-edge-tts.service
+```
+
+The unit reads `.env` for API settings and overrides only `PORT=5051`. Check
+the service with `systemctl --user status openai-edge-tts.service` and query
+`http://localhost:5051/v1/audio/speech`. The voice catalog is available without
+authentication at `GET /v1/voices/all`.
+
 [View this project on Docker Hub](https://hub.docker.com/r/travisvn/openai-edge-tts)
 
 # Please ⭐️ star this repo if you find it helpful
@@ -19,10 +39,10 @@ This project provides a local, OpenAI-compatible text-to-speech (TTS) API using 
 ## Features
 
 - **OpenAI-Compatible Endpoint**: `/v1/audio/speech` with similar request structure and behavior.
-- **Opt-in SSE Streaming**: Real-time MP3 streaming via Server-Sent Events only when `stream_format: "sse"` is specified; normal requests still return MP3 bytes.
-- **Supported Voices**: Maps OpenAI voices (alloy, echo, fable, onyx, nova, shimmer) to `edge-tts` equivalents.
+- **Opt-in SSE Streaming**: Base64-encoded audio chunks via Server-Sent Events when `stream_format: "sse"` is specified; normal requests still return raw audio bytes.
+- **Supported Voices**: Maps OpenAI voices (including alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer, verse, marin, and cedar) to `edge-tts` equivalents.
 - **Flexible Formats**: Supports multiple audio formats (mp3, opus, aac, flac, wav, pcm).
-- **Adjustable Speed**: Option to modify playback speed from 0x to 2x.
+- **Adjustable Speed**: Option to modify playback speed from 0.25x to 4x.
 - **Optional Direct Edge-TTS Voice Selection**: Use either OpenAI voice mappings or specify [any edge-tts voice](https://tts.travisvn.com) directly.
 
 ## ⚡️ Quick start
@@ -281,10 +301,10 @@ Generates audio from the input text. Available parameters:
 - **model** (string): Set to `tts-1`, `tts-1-hd`, or `gpt-4o-mini-tts` (default: `"tts-1"`).
 - **voice** (string): One of the OpenAI-compatible voices (alloy, echo, fable, onyx, nova, shimmer) or any valid `edge-tts` voice (default: `"en-US-AvaNeural"`).
 - **response_format** (string): Audio format. Options: `mp3`, `opus`, `aac`, `flac`, `wav`, `pcm` (default: `mp3`).
-- **speed** (number): Playback speed (0 to 2). Default is `1.0`.
-- **stream_format** (string): Options: `"audio"` (raw audio data, default) or `"sse"` (Server-Sent Events streaming). SSE currently supports MP3 only.
+- **speed** (number): Playback speed (0.25 to 4). Default is `1.0`.
+- **stream_format** (string): Options: `"audio"` (raw audio data, default) or `"sse"` (Server-Sent Events streaming). SSE responses are base64-encoded audio chunks.
 
-**Note:** The API is fully compatible with OpenAI's TTS API specification. The `instructions` parameter (for fine-tuning voice characteristics) is not currently supported, but all other parameters work identically to OpenAI's implementation.
+**Note:** The `instructions` parameter is accepted for OpenAI schema compatibility, but Edge TTS cannot apply provider-specific voice instructions. Custom voice objects are also not supported by the Edge TTS backend.
 
 #### Standard Audio Generation
 

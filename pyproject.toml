@@ -1,0 +1,15 @@
+[project]
+name = "openai-edge-tts"
+version = "0.1.0"
+description = "OpenAI-compatible Text-to-Speech API backed by Edge TTS"
+requires-python = ">=3.10"
+dependencies = [
+  "edge-tts",
+  "emoji",
+  "flask",
+  "gevent",
+  "python-dotenv",
+]
+
+[tool.uv]
+package = false
