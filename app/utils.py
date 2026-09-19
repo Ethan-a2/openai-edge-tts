@@ -15,7 +15,7 @@ def getenv_bool(name: str, default: bool = False) -> bool:
     # For typical usage, the config default (passed at call site) is preferred.
     return os.getenv(name, str(default)).lower() in ("yes", "y", "true", "1", "t")
 
-API_KEY = os.getenv('API_KEY', DEFAULT_CONFIGS["API_KEY"])
+API_KEY = os.getenv('API_KEY', DEFAULT_CONFIGS["API_KEY"]).strip()
 REQUIRE_API_KEY = getenv_bool('REQUIRE_API_KEY', DEFAULT_CONFIGS["REQUIRE_API_KEY"])
 DETAILED_ERROR_LOGGING = getenv_bool('DETAILED_ERROR_LOGGING', DEFAULT_CONFIGS["DETAILED_ERROR_LOGGING"])
 
@@ -32,7 +32,10 @@ def api_error(message: str, code: str, status_code: int = 400, error_type: str =
 def require_api_key(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not REQUIRE_API_KEY:
+        # An empty API_KEY explicitly means unauthenticated mode. This makes
+        # `API_KEY=` useful in local deployments even when the historical
+        # REQUIRE_API_KEY setting remains True in .env.
+        if not REQUIRE_API_KEY or not API_KEY:
             return f(*args, **kwargs)
         candidate_tokens = []
         auth_header = request.headers.get('Authorization', '')

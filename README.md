@@ -32,6 +32,12 @@ the service with `systemctl --user status openai-edge-tts.service` and query
 `http://localhost:5051/v1/audio/speech`. The voice catalog is available without
 authentication at `GET /v1/voices/all`.
 
+Set `API_KEY=` (an empty value) to disable authentication for a local/private
+deployment. In that mode `REQUIRE_API_KEY=True` is harmless and both requests
+with no Authorization header and requests using `Authorization: Bearer $API_KEY`
+are accepted. If `API_KEY` contains a value, normal Bearer or `api-key` header
+validation remains enabled.
+
 [View this project on Docker Hub](https://hub.docker.com/r/travisvn/openai-edge-tts)
 
 # Please ⭐️ star this repo if you find it helpful

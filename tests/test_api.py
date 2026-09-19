@@ -209,6 +209,32 @@ class SpeechApiTestCase(unittest.TestCase):
             utils.REQUIRE_API_KEY = original_required
             utils.API_KEY = original_key
 
+    def test_empty_api_key_disables_authentication(self):
+        original_required = utils.REQUIRE_API_KEY
+        original_key = utils.API_KEY
+        utils.REQUIRE_API_KEY = True
+        utils.API_KEY = ""
+        try:
+            with patch.object(server, "validate_voice"), patch.object(
+                server, "generate_speech", side_effect=lambda *args: self._temporary_audio_path(b"audio")
+            ):
+                response = self.client.post(
+                    "/v1/audio/speech",
+                    json=self._request_payload(),
+                )
+        finally:
+            utils.REQUIRE_API_KEY = original_required
+            utils.API_KEY = original_key
+
+        self.assertEqual(response.status_code, 200)
+
+    @staticmethod
+    def _temporary_audio_path(data):
+        audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        audio_file.write(data)
+        audio_file.close()
+        return audio_file.name
+
 
 class SpeechStreamBridgeTestCase(unittest.TestCase):
     def test_async_generator_is_exposed_as_sync_generator(self):
