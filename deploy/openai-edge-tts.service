@@ -5,8 +5,6 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=bay
-Group=bay
 WorkingDirectory=/media/code/tools/openai-edge-tts
 EnvironmentFile=-/media/code/tools/openai-edge-tts/.env
 Environment=PORT=5051
@@ -17,4 +15,4 @@ RestartSec=5
 TimeoutStopSec=15
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
